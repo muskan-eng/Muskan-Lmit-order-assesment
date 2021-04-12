@@ -1,0 +1,1737 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Imports"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import seaborn as sns\n",
+    "import matplotlib.pyplot as plt\n",
+    "import re\n",
+    "from sklearn import metrics\n",
+    "# import cvxopt # <- installation via conda recommended\n",
+    "from collections import defaultdict\n",
+    "from tqdm import tqdm\n",
+    "from sklearn.feature_extraction.text import CountVectorizer\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from sklearn.linear_model import LogisticRegression\n",
+    "import nltk\n",
+    "import scipy.optimize as sopt\n",
+    "import scipy.stats as sstats\n",
+    "import csv\n",
+    "from scipy.linalg import solve_triangular"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Motivation"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Given LOB (Limit Order Book) data and certain points in time our goal is to predict, whether the price will increase or decrease. <br>\n",
+    "We will be using LOB data from London stock market, collected for September 2013. <br>\n",
+    "Main method used is Logistic regression. <br>"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Data description"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Every row of our data represents all active ask and bid orders in some point in time. Row can be described as follows:\n",
+    "\n",
+    "$date/time$ $'BID'$ $p_{b1}$ $w_{b1}$ $p_{b2}$ $w_{b2}$ ... $p_{bn}$ $w_{bn}$ $'ASK'$ $p_{a1}$ $w_{a1}$ $p_{a2}$ $w_{a2}$ ... $p_{am}$ $w_{am}$,\n",
+    "where $p_b$, $w_b$ are prices and size of bid order and $p_a$, $w_a$ are prices and sizes of ask order. Prices $p_x$ are sorted ascending. <br>\n",
+    "\n",
+    "LOB data is often represented as 3-element tuples $(p_x,w_x,t_x)$, where $p_x,w_x,t_x$ represent price, size and time of $xth$ order and $w_x$ is greater than zero for ask order.\n",
+    "\n",
+    "In our case it is convenient to represent the data as a list of pairs, where first element of each pair is bid orders list and second one is ask orders lists. <br>\n",
+    "\n",
+    "More formally let $$data = D$$ and for given time ${i}$, $${D_i} = ({BID_i}, {ASK_i})$$  $$BID_{ix} = ({p_x}, {w_x})$$ $$ASK_{ix} = ({p_x}, {w_x})$$ for some index $x$. <br>\n",
+    "Moreover bid and ask lists contain $(p_x, w_x)$ pairs, where $w_x > 0$ for all orders.\n",
+    "\n",
+    "We consider orders from $8:30$ to $16:30$ to eliminate abnormal trading behaviour that can occur shortly after the opening auction or shortly before closing auction."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Data loading"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def load_data(path, start_time=83000000, stop_time=163000000):\n",
+    "    X = []\n",
+    "    with open(path,newline='') as file:\n",
+    "        csv_reader = csv.reader(file, delimiter='\\t')\n",
+    "        for row in csv_reader:\n",
+    "            date, time = map(int, row[0].split(' '))\n",
+    "            if time < start_time or time > stop_time:\n",
+    "                continue\n",
+    "            \n",
+    "            line = 2\n",
+    "            ASK_list, BID_list = [], []\n",
+    "            \n",
+    "            while line < len(row):\n",
+    "                if row[line] == 'ASK':\n",
+    "                    break\n",
+    "                p,w = map(float, row[line: line+2])\n",
+    "                BID_list.append((p, w))\n",
+    "                line += 2\n",
+    "            line += 1\n",
+    "            while line < len(row):\n",
+    "                p,w = map(float, row[line: line+2])\n",
+    "                ASK_list.append((p, w))\n",
+    "                line += 2\n",
+    "            \n",
+    "            X.append((BID_list, ASK_list))\n",
+    "\n",
+    "    return X "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "path = \"C:\\Projekt_ED\\OrderBookSnapshots.csv\"\n",
+    "data = load_data(path)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "4810"
+      ]
+     },
+     "execution_count": 4,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(data)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Data visualization"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Whole data\n",
+    "(One can see that if ask and bid prices intersect the transaction can be made.)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "BID, ASK = [], []\n",
+    "\n",
+    "for t in data:\n",
+    "    BID_list = t[0]\n",
+    "    ASK_list = t[1]\n",
+    "    \n",
+    "    BID += BID_list\n",
+    "    ASK += ASK_list\n",
+    "    \n",
+    "BID = np.array(BID)\n",
+    "ASK = np.array(ASK)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "<matplotlib.legend.Legend at 0x1ef1c6fa808>"
+      ]
+     },
+     "execution_count": 6,
+     "metadata": {},
+     "output_type": "execute_result"
+    },
+    {
+     "data": {
+      "image/png""text/plain": [
+       "<Figure size 1080x360 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "plt.figure(figsize=(15, 5))\n",
+    "plt.scatter(BID[:, 0], BID[:, 1], c='green', alpha=0.6, edgecolors='black', label='BID', s=60)\n",
+    "plt.scatter(ASK[:, 0], ASK[:, 1], c='red', alpha=0.6, edgecolors='black', label='ASK', s=60)\n",
+    "plt.legend(loc='lower left')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## In some fixed time interval\n",
+    "${t}=100$"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "(0, 6000)"
+      ]
+     },
+     "execution_count": 7,
+     "metadata": {},
+     "output_type": "execute_result"
+    },
+    {
+     "data": {
+      #output would an image     
+  "text/plain": [
+       "<Figure size 1080x360 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "BID, ASK = data[100][0], data[100][1]\n",
+    "BID, ASK = np.array(BID), np.array(ASK)\n",
+    "\n",
+    "plt.figure(figsize=(15, 5))\n",
+    "plt.bar(BID[:, 0], BID[:, 1], width=0.3, color='green', alpha=0.6, label='BID')\n",
+    "plt.bar(ASK[:, 0], ASK[:, 1], width=0.3, color='red', alpha=0.6, label='ASK')\n",
+    "plt.vlines(x=3030.5, ymin=0, ymax=10000, label='mid price', linestyles='dashed')\n",
+    "plt.legend(loc='upper left')\n",
+    "plt.xlim(3026, 3035)\n",
+    "plt.ylim(0, 6000)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Data process functions"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "At given time $t$, the bid price $b(t)$ is the highest stated price among active buy orders,  \n",
+    "$$b(t) = \\max_{x \\in BIDlist(t)} p_x $$  \n",
+    "and the ask price $a(t)$ is the lowest stated price among active sell orders,  \n",
+    "$$a(t) = \\min_{x \\in ASKlist(t)} p_x $$  \n",
+    "The mid price at time $t$ is  \n",
+    "$$m(t) = \\frac{a(t)+b(t)}{2} $$  \n",
+    "  \n",
+    "The bid size $n_b(t)$ is total size of active buy orders with price equal to bid price  \n",
+    "$$n_b(t) = \\sum_{x \\in BIDlist(t) | px = b(t)} w_x $$  \n",
+    "and ask size $n_b(t)$ is total size of active sell orders with price equal to ask price  \n",
+    "$$n_a(t) = \\sum_{x \\in ASKlist(t) | px = a(t)} w_x $$  \n",
+    "  \n",
+    "At a given time $t$, the queue imbalance $I(t)$ is normalized difference between $n_b(t)$ and $n_a(t)$  \n",
+    "$$I(t) = \\frac{n_b(t) - n_a(t)}{n_b(t) + n_a(t)} $$  \n",
+    "  \n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We can expend those definitions considering k highest (lowest) bid (ask) prices.\n",
+    "<center>$b_k(t) = k-th$ highest price $\\in BIDlist(t)$</center>  \n",
+    "   \n",
+    "<center>$a_k(t) = k-th$ lowest price $\\in ASKlist(t)$</center>  \n",
+    "  \n",
+    "<center>$n_{k,b}(t) = \\sum_{x \\in BIDlist(t) | px \t\\geqslant b_k(t)} w_x $</center>  \n",
+    "  \n",
+    "<center>$n_{k,a}(t) = \\sum_{x \\in ASKlist(t) | px \\leqslant a_k(t)} w_x $</center>  \n",
+    "  \n",
+    "At a given time $t$, the $k-th$ queue imbalance $I_k(t)$ is normalized difference between $n_{k,b}(t)$ and $n_{k,b}(t)$  \n",
+    "<center>$I_k(t) = \\frac{n_{k,b}(t) - n_{k,a}(t)}{n_{k,b}(t) + n_{k,a}(t)} $</center>  \n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def bid_price(data,t):\n",
+    "    return data[t][0][-1][0]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def ask_price(data,t):\n",
+    "    return data[t][1][0][0]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def mid_price(data,t):\n",
+    "    return (bid_price(data,t) + ask_price(data,t))/2"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def bid_size(data,t):\n",
+    "    return data[t][0][-1][1]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def ask_size(data,t):\n",
+    "    return data[t][1][0][1]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def queue_imbalance(data,t):\n",
+    "    nb = bid_size(data,t)\n",
+    "    na = ask_size(data,t)\n",
+    "    return (nb-na)/(nb+na)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def queue_imbalance_k(data,t,k=2):\n",
+    "    sb = 0\n",
+    "    sa = 0\n",
+    "    for i in range(k):\n",
+    "        sb += data[t][0][-(i+1)][1]\n",
+    "        sa += data[t][1][i][1]\n",
+    "    return (sb-sa)/(sb+sa)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Midprices\n",
+    "If we plot how midprices changed over the time we will get typical auction value graph. <br>\n",
+    "One can see how hard it is to predict, whether the price goes up or down."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      #output would be an image 
+      "text/plain": [
+       "<Figure size 1080x360 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "M_x = []\n",
+    "for i in range(len(data)):\n",
+    "    M_x.append(mid_price(data, i))\n",
+    "\n",
+    "plt.figure(figsize=(15,5))\n",
+    "plt.plot(range(len(data)), M_x)\n",
+    "plt.ylabel('midprice')\n",
+    "plt.xlabel('time')\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Target defining"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "First in order to obtain binary targets we consider only moments when the price does change. <br>\n",
+    "Thus let us define vector of those moments:\n",
+    "$$T = [t_x | m(t_x^0) \\neq m(t_{x-1}^0)],$$ where $t_x^0$ are all times included in dataset.<br>\n",
+    "Size of this vector equals $N = |T| $. <br>\n",
+    "\n",
+    "Now targets are defined as 1 if price increases, 0 otherwise. I.e.\n",
+    "$$\n",
+    "target_x =\n",
+    "\\begin{cases}\n",
+    "1 & \\text{ if } \\ m(t_{x+1}) > m(t_{x}) \\\\\n",
+    "0 & \\text{ if } \\ m(t_{x+1}) < m(t_{x})\n",
+    "\\end{cases}\n",
+    "$$\n",
+    "\n",
+    "Furthermore we shift $T$ forwards by setting ${T_0}$ as 0, <br>\n",
+    "because we want to model ${target_x}$ that happend after moment ${t_x}$."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_time_and_target(data):\n",
+    "    T = [0]\n",
+    "    target = []\n",
+    "    for t in range(1, len(data)):\n",
+    "        t_1 = T[-1]\n",
+    "        mt = mid_price(data, t)\n",
+    "        mt_1 = mid_price(data, t_1)\n",
+    "        if mt != mt_1:\n",
+    "            T.append(t)\n",
+    "            if mt > mt_1:\n",
+    "                target.append(1)\n",
+    "            else:\n",
+    "                target.append(0)\n",
+    "    return np.array(T[:-1]), np.array(target)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "T, target = get_time_and_target(data)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Number of data with target = 0: 2128\n",
+      "Number of data with target = 1: 2208\n",
+      "Ratio of target = 0 for train data: 0.4907749077490775\n"
+     ]
+    }
+   ],
+   "source": [
+    "vals,counts = np.unique(target,return_counts=True)\n",
+    "for i,v in enumerate(vals):\n",
+    "    print(f'Number of data with target = {v}: {counts[i]}')\n",
+    "print(f'Ratio of target = {vals[0]} for train data: {counts[0] / counts.sum()}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Data matrix definition"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Now we can define our data matrix.\n",
+    "$$\n",
+    "\\begin{bmatrix}\n",
+    "    I_1(t_0) & I_2(t_0) &I_3(t_0) & \\dots  & I_K(t_0) \\\\\n",
+    "    I_1(t_1) & I_2(t_1) &I_3(t_1) & \\dots  & I_K(t_1) \\\\\n",
+    "    \\vdots & \\vdots & \\vdots & \\ddots & \\vdots \\\\\n",
+    "    I_1(t_N) & I_2(t_N) &I_3(t_N) & \\dots  & I_K(t_N) \\\\\n",
+    "\\end{bmatrix}\n",
+    "$$\n",
+    "We can notice, that for $K=1$ our data matrix is equal to:\n",
+    "$$\n",
+    "\\begin{bmatrix}\n",
+    "    I(t_0) \\\\\n",
+    "    I(t_1) \\\\\n",
+    "    \\vdots \\\\\n",
+    "    I(t_N) \\\\\n",
+    "\\end{bmatrix}\n",
+    "$$"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "dtype('float64')"
+      ]
+     },
+     "execution_count": 19,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "K = 2\n",
+    "X = np.array([[queue_imbalance_k(data,t,k) for k in range(1, K+1)] for t in T])\n",
+    "X.dtype"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Train test split\n",
+    "We split the data using 80% as train and 20% as test."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "X_train, X_test, y_train, y_test = train_test_split(\n",
+    "X, target, test_size=0.2, random_state=42, shuffle=False)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Baseline"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We define baseline accuracy for LOB data, so later we can compare it with our model."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Number of train data with target = 0: 1708\n",
+      "Baseline for target = 0 for train data: 0.4925028835063437\n",
+      "Number of train data with target = 1: 1760\n",
+      "Baseline for target = 1 for train data: 0.5074971164936563\n",
+      "\n",
+      "Number of test data with target = 0: 420\n",
+      "Baseline for target = 0 for train data: 0.4838709677419355\n",
+      "Number of test data with target = 1: 448\n",
+      "Baseline for target = 1 for train data: 0.5161290322580645\n"
+     ]
+    }
+   ],
+   "source": [
+    "vals_train,counts_train = np.unique(y_train,return_counts=True)\n",
+    "for i,v in enumerate(vals_train):\n",
+    "    print(f'Number of train data with target = {v}: {counts_train[i]}')\n",
+    "    print(f'Baseline for target = {v} for train data: {counts_train[i] / counts_train.sum()}')\n",
+    "print()\n",
+    "vals_test,counts_test = np.unique(y_test,return_counts=True)\n",
+    "for i,v in enumerate(vals_test):\n",
+    "    print(f'Number of test data with target = {v}: {counts_test[i]}')\n",
+    "    print(f'Baseline for target = {v} for train data: {counts_test[i] / counts_test.sum()}')\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def print_score(preds,Y,name):\n",
+    "    print(name)\n",
+    "    acc = np.mean(preds == Y)\n",
+    "    print(f\"Acc: {acc}\")\n",
+    "    M = metrics.confusion_matrix(preds, Y)\n",
+    "    N = np.sum(M)\n",
+    "    print('\\nConfusion matrix:')\n",
+    "    print(M)\n",
+    "    print(f'\\nTrue negative, (price goes down): {M[0][0]}')\n",
+    "    print(f'True positive, (price goes up): {M[1][1]}')\n",
+    "    print(f'False negative: {M[0][1]}')\n",
+    "    print(f'False positive: {M[1][0]}')\n",
+    "    return M,N,acc"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Logistic regression"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Our goal is to predict if $m_{t+1} > m_t$ using data vector\n",
+    "$$\n",
+    "\\begin{bmatrix}\n",
+    "    I_1(t) & I_2(t) &I_3(t) & \\dots  & I_K(t) \\\\\n",
+    "\\end{bmatrix}\n",
+    "$$"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We use logistic regression.\n",
+    "That way we can calculate probability of the sample $x$ belonging to class 1.\n",
+    "$$p(y=1|x) = \\sigma(\\theta^Tx) = \\frac{1}{1 + e^{-\\theta^Tx}}$$  \n",
+    "\n",
+    "We can observe that:  \n",
+    "$$ p(y=y^{(i)}|x^{(i)};\\Theta) = \\sigma(\\Theta^Tx)^{y^{(i)}}(1-\\sigma(\\Theta^Tx))^{(1-y^{(i)})}$$  \n",
+    "\n",
+    "Therefore the negative log likelihood ($nll$) is:$$\n",
+    "\\begin{split}\n",
+    "nll(\\Theta) &= -\\sum_{i=1}^{N} y^{(i)} \\log \\sigma(\\Theta^Tx) + (1-y^{(i)})\\log(1-\\sigma(\\Theta^Tx)) = \\\\\n",
+    "&= -\\sum_{i=1}^{N}y^{(i)}\\log p(y=1|x^{(i)}; \\Theta) + (1-y^{(i)})\\log  p(y=0|x^{(i)}; \\Theta)\n",
+    "\\end{split}\n",
+    "$$\n",
+    "\n",
+    "So we are searching for $\\theta$:\n",
+    "$$\\theta = arg\\,min_{\\theta} \\ nll(\\theta) $$  \n",
+    "  \n",
+    "We can further consider logistic regression with regularization, where:$$\n",
+    "\\begin{split}\n",
+    "nll(\\Theta) &= -\\sum_{i=1}^{N}y^{(i)}\\log p(y=1|x^{(i)}; \\Theta) + (1-y^{(i)})\\log  p(y=0|x^{(i)}; \\Theta) + \\frac{\\lambda}{2} \\sum_{i}\\theta_{i}^{2}\n",
+    "\\end{split}\n",
+    "$$\n",
+    "\n",
+    "There are a few ways to find $\\theta$. First we will consider Newtod-Raphson Method and L-BFGS-B solver, then we will compare results with sklearn LogisticRegression."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Newton's method is an iterative method for finding the roots of a differentiable function $F$, which are solutions to the equation $F(x) = 0$. For give start approximation $x_n$ we can calculate better approximation of the root:  \n",
+    "$$x_{n+1} = x_n - \\frac{f(x)}{f'(x)} $$  \n",
+    "  \n",
+    "We can use this method to find root of $F'$, where is local optimum of $F$.  \n",
+    "  \n",
+    "For given approximation $x_n$ we can calculate better approximation of local optimum:  \n",
+    "$$x_{n+1} = x_n - \\gamma [f''(x_n)]^{-1} f'(x_n) $$\n",
+    "$$\\text{where} \\ 0<\\gamma<1,$$\n",
+    "$$f'(x) = \\nabla f(x) \\in \\mathbb {R} ^{d}$$\n",
+    "$$ f''(x)=\\nabla ^{2}f(x)=H_{f}(x) \\in \\mathbb {R} ^{d\\times d} $$\n",
+    "$$H_{f}(x) \\  \\text{is Hessian matrix and} \\ \\gamma \\ \\text{is step size.}$$"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## L-BFGS-B solver"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "L-BFGS-B solver tries to find optimum of $f$ function using $\\nabla f(x)$."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class Logistic_Regression:\n",
+    "    def __init__(self, max_iter=500, solver_calls=5, lambda_=0.5, Theta=None, \\\n",
+    "                 solver='l_bfgs_b', debug=False):\n",
+    "        self.Theta = Theta\n",
+    "        self.solver_calls = solver_calls\n",
+    "        self.max_iter = max_iter\n",
+    "        self.solver = solver\n",
+    "        self.debug = debug\n",
+    "        self.lambda_ = lambda_\n",
+    "    \n",
+    "    def __sigmoid(self,x):\n",
+    "        return 1 / (1 + np.exp(-x))   \n",
+    "    \n",
+    "    def __gradient(self,x,y,Theta):\n",
+    "        SZ = self.__sigmoid(np.dot(Theta,x.T))\n",
+    "        return np.dot(x.T, (y-SZ).T) + self.lambda_ * Theta\n",
+    "    \n",
+    "    def __hessian(self,x,y,Theta):\n",
+    "        SZ = self.__sigmoid(np.dot(Theta,x.T))\n",
+    "        hess = np.dot(x.T,x * (SZ).reshape(-1,1) * (1 - SZ).reshape(-1,1))\n",
+    "        hess += np.eye(hess.shape[0]) * self.lambda_\n",
+    "        return hess\n",
+    "    \n",
+    "    def __logreg_loss(self, Theta, X, Y):\n",
+    "        Theta = Theta.astype(np.float64)\n",
+    "        X = X.astype(np.float64)\n",
+    "        Y = Y.astype(np.float64)\n",
+    "        \n",
+    "        if self.debug:\n",
+    "            print(f\"Loss calculating... \",end=\"\")\n",
+    "        Z = np.dot(Theta,X.T)\n",
+    "        if self.debug:\n",
+    "            print(f\" Z done... \",end=\"\")\n",
+    "        SZ = self.__sigmoid(Z)\n",
+    "        Y_ = Y[:,np.newaxis]\n",
+    "        nll = -np.sum((Y_*np.log2(SZ+1e-50) + (1-Y_)*np.log2(1-SZ+1e-50)))\n",
+    "        nll += (self.lambda_/2) * np.sum(Theta**2)\n",
+    "        if self.debug:\n",
+    "            print(f\" nll done... \",end=\"\")\n",
+    "        grad = np.dot(X.T, (SZ - Y).T)\n",
+    "        grad = grad.reshape(Theta.shape) + self.lambda_ * Theta\n",
+    "        if self.debug:\n",
+    "            print(f\" grad done... done \")\n",
+    "        return nll, grad\n",
+    "    \n",
+    "    \n",
+    "    def fit(self,X,y):\n",
+    "        if self.solver == 'l_bfgs_b':\n",
+    "            Theta = self.Theta\n",
+    "            if Theta is None:\n",
+    "                Theta = np.ones(X.shape[1]+1)\n",
+    "\n",
+    "            X_with_ones = np.hstack((np.ones((X.shape[0],1)),X))\n",
+    "\n",
+    "            for i in tqdm(range(self.solver_calls), desc='Calculating Theta', position=0):\n",
+    "                Theta = sopt.fmin_l_bfgs_b(lambda th: self.__logreg_loss(th, X_with_ones, y), \n",
+    "                                    Theta, maxiter=self.max_iter)[0]\n",
+    "            self.Theta = Theta\n",
+    "            \n",
+    "        elif self.solver == 'newton':\n",
+    "            X_with_ones = np.hstack((np.ones((X.shape[0],1)),X))\n",
+    "            Theta = np.ones(X.shape[1]+1)\n",
+    "            g = self.__gradient(X_with_ones,y,Theta)\n",
+    "            i = 0\n",
+    "            while not np.all(np.isclose(g, 0, atol=0.00001)) and i < self.max_iter:\n",
+    "                hess_inv = np.linalg.inv(self.__hessian(X_with_ones, y, Theta))\n",
+    "                Theta = np.add(Theta, np.dot(hess_inv, g))\n",
+    "                g = self.__gradient(X_with_ones, y, Theta)\n",
+    "                i += 1\n",
+    "            self.Theta = Theta\n",
+    "        \n",
+    "        else:\n",
+    "            print(f'Wrong solver!: {self.solver}')\n",
+    "            \n",
+    "\n",
+    "    def predict(self, X, threshold=0.5):\n",
+    "        X_with_ones = np.hstack((np.ones((X.shape[0],1)),X))\n",
+    "        preds = self.__sigmoid(np.dot(self.Theta, X_with_ones.T)) >= threshold\n",
+    "#         preds = np.dot(self.Theta, X_with_ones.T) >= 0\n",
+    "        return preds"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "LR_solver = Logistic_Regression(solver='l_bfgs_b')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 25,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Calculating Theta: 100%|¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦| 5/5 [00:21<00:00,  4.25s/it]\n"
+     ]
+    }
+   ],
+   "source": [
+    "LR_solver.fit(X_train,y_train)\n",
+    "preds_train_solver = LR_solver.predict(X_train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Train data, L-BFGS-B solver, lambda=0.5\n",
+      "Acc: 0.5406574394463668\n",
+      "\n",
+      "Confusion matrix:\n",
+      "[[ 820  705]\n",
+      " [ 888 1055]]\n",
+      "\n",
+      "True negative, (price goes down): 820\n",
+      "True positive, (price goes up): 1055\n",
+      "False negative: 705\n",
+      "False positive: 888\n"
+     ]
+    }
+   ],
+   "source": [
+    "M,N,acc = print_score(preds_train_solver,y_train,\n",
+    "                      'Train data, L-BFGS-B solver, lambda=0.5')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 27,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "preds_test_solver = LR_solver.predict(X_test)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 28,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Test data, L-BFGS-B solver, lambda=0.5\n",
+      "Acc: 0.543778801843318\n",
+      "\n",
+      "Confusion matrix:\n",
+      "[[168 144]\n",
+      " [252 304]]\n",
+      "\n",
+      "True negative, (price goes down): 168\n",
+      "True positive, (price goes up): 304\n",
+      "False negative: 144\n",
+      "False positive: 252\n"
+     ]
+    }
+   ],
+   "source": [
+    "M,N,acc = print_score(preds_test_solver,y_test,\n",
+    "                      'Test data, L-BFGS-B solver, lambda=0.5')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Newtod-Raphson Method"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "LR_newton = Logistic_Regression(solver='newton')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 30,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "LR_newton.fit(X_train, y_train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 31,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "preds_train_newton = LR_newton.predict(X_train, threshold=0.5)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 32,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Train data, Newton method, lambda=0.5\n",
+      "Acc: 0.540080738177624\n",
+      "\n",
+      "Confusion matrix:\n",
+      "[[ 845  732]\n",
+      " [ 863 1028]]\n",
+      "\n",
+      "True negative, (price goes down): 845\n",
+      "True positive, (price goes up): 1028\n",
+      "False negative: 732\n",
+      "False positive: 863\n"
+     ]
+    }
+   ],
+   "source": [
+    "M,N,acc = print_score(preds_train_newton,y_train,\n",
+    "                      'Train data, Newton method, lambda=0.5')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 33,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "preds_test_newton = LR_newton.predict(X_test)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 34,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Test data, Newton method, lambda=0.5\n",
+      "Acc: 0.5552995391705069\n",
+      "\n",
+      "Confusion matrix:\n",
+      "[[189 155]\n",
+      " [231 293]]\n",
+      "\n",
+      "True negative, (price goes down): 189\n",
+      "True positive, (price goes up): 293\n",
+      "False negative: 155\n",
+      "False positive: 231\n"
+     ]
+    }
+   ],
+   "source": [
+    "M,N,acc = print_score(preds_test_newton,y_test,\n",
+    "                      'Test data, Newton method, lambda=0.5')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Sklearn"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We also consider Sklearn implementation of Logistic Regression with L-BFGS-B solver."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 35,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "LR_sklearn = LogisticRegression(solver='lbfgs')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 36,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "LogisticRegression(C=1.0, class_weight=None, dual=False, fit_intercept=True,\n",
+       "                   intercept_scaling=1, l1_ratio=None, max_iter=100,\n",
+       "                   multi_class='warn', n_jobs=None, penalty='l2',\n",
+       "                   random_state=None, solver='lbfgs', tol=0.0001, verbose=0,\n",
+       "                   warm_start=False)"
+      ]
+     },
+     "execution_count": 36,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "LR_sklearn.fit(X_train,y_train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 37,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "preds_train_sklearn = LR_sklearn.predict(X_train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 38,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Train data, sklearn LR, C=1.0\n",
+      "Acc: 0.5403690888119954\n",
+      "\n",
+      "Confusion matrix:\n",
+      "[[ 846  732]\n",
+      " [ 862 1028]]\n",
+      "\n",
+      "True negative, (price goes down): 846\n",
+      "True positive, (price goes up): 1028\n",
+      "False negative: 732\n",
+      "False positive: 862\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "(array([[ 846,  732],\n",
+       "        [ 862, 1028]], dtype=int64), 3468, 0.5403690888119954)"
+      ]
+     },
+     "execution_count": 38,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "print_score(preds_train_sklearn,y_train,\n",
+    "                      'Train data, sklearn LR, C=1.0')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 39,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "preds_test_sklearn = LR_sklearn.predict(X_test)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 40,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Test data, sklearn LR, C=1.0\n",
+      "Acc: 0.5576036866359447\n",
+      "\n",
+      "Confusion matrix:\n",
+      "[[190 154]\n",
+      " [230 294]]\n",
+      "\n",
+      "True negative, (price goes down): 190\n",
+      "True positive, (price goes up): 294\n",
+      "False negative: 154\n",
+      "False positive: 230\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "(array([[190, 154],\n",
+       "        [230, 294]], dtype=int64), 868, 0.5576036866359447)"
+      ]
+     },
+     "execution_count": 40,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "print_score(preds_test_sklearn,y_test,\n",
+    "                      'Test data, sklearn LR, C=1.0')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Testing our regression for different Ks"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def plot_bar(X, Y1, Y2, title, x_title, width=0.02, a=0, b=-1):\n",
+    "    def autolabel(rects):\n",
+    "        for rect in rects:\n",
+    "            height = rect.get_height()\n",
+    "            ax.annotate('{:.2f}%'.format(height * 100),\n",
+    "                        xy=(rect.get_x() + rect.get_width() / 2, height),\n",
+    "                        xytext=(0, 3),  # 3 points vertical offset\n",
+    "                        textcoords=\"offset points\",\n",
+    "                        ha='center', va='bottom')\n",
+    "        \n",
+    "    fig, ax = plt.subplots(figsize=(15,5))\n",
+    "    rects1 = ax.bar(X[a: b] - width/2, Y1[a: b], width, label='Train')\n",
+    "    rects2 = ax.bar(X[a: b] + width/2, Y2[a: b], width, label='Test')\n",
+    "    ax.set_ylabel('Accuracy')\n",
+    "    ax.set_xlabel(x_title)\n",
+    "    ax.set_xticks(X[a: b])\n",
+    "    ax.set_ylim([0, 0.7])\n",
+    "    ax.set_title(title)\n",
+    "    ax.legend(loc='lower right')\n",
+    "    autolabel(rects1)\n",
+    "    autolabel(rects2)\n",
+    "    \n",
+    "    \n",
+    "def plot(X, Y1, Y2, title, x_title):\n",
+    "    plt.plot(X, Y1, label='Train')\n",
+    "    plt.plot(X, Y2, label='Test')\n",
+    "    plt.title(title)\n",
+    "    plt.legend(loc='lower left')\n",
+    "    plt.xlabel(x_title)\n",
+    "    plt.ylabel('Accuracy')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 42,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_c, test_c = [], []\n",
+    "k_list = np.arange(1, 11)\n",
+    "\n",
+    "for K in k_list:\n",
+    "    X = np.array([[queue_imbalance_k(data,t,k) for k in range(1,K+1)] for t in T])\n",
+    "    X_train, X_test, y_train, y_test = train_test_split(\n",
+    "        X, target, test_size=0.2, random_state=42,shuffle=False)\n",
+    "    LR = Logistic_Regression(solver='newton')\n",
+    "    LR.fit(X_train, y_train)\n",
+    "    preds_train = LR.predict(X_train)\n",
+    "    train_c.append(np.mean(preds_train == y_train))\n",
+    "    preds_test = LR.predict(X_test)\n",
+    "    test_c.append(np.mean(preds_test == y_test))\n",
+    "\n",
+    "train_c = np.array(train_c)\n",
+    "test_c = np.array(test_c)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 43,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      # output would be an image 
+  "text/plain": [
+       "<Figure size 432x288 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "plot(X=k_list, Y1=train_c, Y2=test_c, title='Accuracy for different Ks', \\\n",
+    "     x_title='K')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 44,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      #output would be an image 
+"text/plain": [
+       "<Figure size 1080x360 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      #output would be an image/png
+ "text/plain": [
+       "<Figure size 1080x360 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "plot_bar(X=k_list, Y1=train_c, Y2=test_c, title='Accuracy for different Ks', \\\n",
+    "         x_title='K', width=0.4, b=len(k_list) // 2)\n",
+    "plot_bar(X=k_list, Y1=train_c, Y2=test_c, title='Accuracy for different Ks', \\\n",
+    "         x_title='K', width=0.4, a=len(k_list) // 2, b=len(k_list))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 45,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Best K: 2\n"
+     ]
+    }
+   ],
+   "source": [
+    "# chosing best K\n",
+    "best_k = k_list[np.argmax(test_c)]\n",
+    "print(f'Best K: {best_k}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Testing for different Cs"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 46,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_c, test_c = [], []\n",
+    "C_list = np.r_[np.linspace(0.01,1,9), np.linspace(1,10,9)]\n",
+    "\n",
+    "X = np.array([[queue_imbalance_k(data,t,k) for k in range(1, best_k+1)] for t in T])\n",
+    "X_train, X_test, y_train, y_test = train_test_split(\n",
+    "    X, target, test_size=0.2, random_state=42,shuffle=False)\n",
+    "    \n",
+    "for C in C_list:\n",
+    "    LR = Logistic_Regression(solver='newton', lambda_=C)\n",
+    "    LR.fit(X_train, y_train)\n",
+    "    preds_train = LR.predict(X_train)\n",
+    "    train_c.append(np.mean(preds_train == y_train))\n",
+    "    preds_test = LR.predict(X_test)\n",
+    "    test_c.append(np.mean(preds_test == y_test))\n",
+    "\n",
+    "train_c = np.array(train_c)\n",
+    "test_c = np.array(test_c)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 47,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      #output would be an image 
+      "text/plain": [
+       "<Figure size 432x288 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "plot(X=C_list, Y1=train_c, Y2=test_c, title='Accuracy for different Cs',\\\n",
+    "     x_title='C')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 48,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      #output would be an image 
+"text/plain": [
+       "<Figure size 1080x360 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      #output would be an image
+      "text/plain": [
+       "<Figure size 1080x360 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "plot_bar(X=C_list, Y1=train_c, Y2=test_c, title='Accuracy for different Cs', \\\n",
+    "         x_title='C', width=0.06, b=len(C_list) // 2)\n",
+    "plot_bar(X=C_list, Y1=train_c, Y2=test_c, title='Accuracy for different Cs', \\\n",
+    "         x_title='C', width=0.5, a=len(C_list) // 2, b=-1)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 49,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Best c: 3.25\n"
+     ]
+    }
+   ],
+   "source": [
+    "# chose best C\n",
+    "best_c = C_list[np.argmax(test_c)]\n",
+    "print(f'Best c: {best_c}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Testing different thresholds"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 50,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# we will also save FP and TP rate for later\n",
+    "\n",
+    "train_c, test_c = [], []\n",
+    "FPR, TPR, TNR = [], [], []\n",
+    "threshold = np.linspace(0, 1, 25)\n",
+    "X = np.array([[queue_imbalance_k(data,t,k) for k in range(1, best_k+1)] for t in T])\n",
+    "X_train, X_test, y_train, y_test = train_test_split(\n",
+    "    X, target, test_size=0.2, random_state=42,shuffle=False)\n",
+    "    \n",
+    "for th in threshold:\n",
+    "    LR = Logistic_Regression(solver='newton', lambda_=best_c)\n",
+    "    LR.fit(X_train, y_train)\n",
+    "    preds_train = LR.predict(X_train, threshold=th)\n",
+    "    train_c.append(np.mean(preds_train == y_train))\n",
+    "    preds_test = LR.predict(X_test, threshold=th)\n",
+    "    test_c.append(np.mean(preds_test == y_test))\n",
+    "    M = metrics.confusion_matrix(preds_test, y_test)\n",
+    "    TP, FP = M[1][1], M[1][0]\n",
+    "    TN, FN = M[0][0], M[0][1]\n",
+    "    FPR.append(FP / (FP + TN + 1e-50))\n",
+    "    TPR.append(TP / (TP + FN + 1e-50))\n",
+    "    TNR.append(TN / (TN + FP + 1e-50))\n",
+    "\n",
+    "train_c = np.array(train_c)\n",
+    "test_c = np.array(test_c)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 51,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      #output woukd be an image
+      "text/plain": [
+       "<Figure size 432x288 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "plot(X=threshold, Y1=train_c, Y2=test_c, title='Accuracy for different thresholds', \\\n",
+    "     x_title='threshold')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 52,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "best_accuracy=np.max(test_c)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 53,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Best accuracy: 0.5587557603686636 for K: 2, lambda: 3.25, treshold: 0.5\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(f'Best accuracy: {best_accuracy} for K: {best_k}, lambda: {best_c}, \\\n",
+    "treshold: {threshold[np.argmax(test_c)]}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 54,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      #output woukd be an image
+      "text/plain": [
+       "<Figure size 1080x360 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "plot_bar(X=threshold, Y1=train_c, Y2=test_c, title='Accuracy for different thresholds', \\\n",
+    "         x_title='threshold', width=0.02, a=len(threshold) // 2 - 3, b=len(threshold) // 2 + 4) "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Receiver operating characteristic"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "ROC curve, is a graphical plot that illustrates the diagnostic ability of a binary classifier system as its discrimination threshold is varied. <br>\n",
+    "The ROC curve is created by plotting the true positive rate (TPR) against the false positive rate (FPR) at various threshold settings. <br>\n",
+    "\n",
+    "To assess the predictive power of our logistic regressions for performing binary <br>\n",
+    "and probabilistic classification, we compare their output to that of a simple null <br>\n",
+    "model in which we assume that I provides no useful information for predicting <br> \n",
+    "the direction of mid-price movements, such that for all $I$: <br>\n",
+    "\n",
+    "$$y(I) = \\frac{1}{2}$$\n",
+    "\n",
+    "In words, our null model predicts that the probability of an upward or downward price movement is always 50%, irrespective of the queue imbalance. <br>\n",
+    "We calculate area under the curve by a number of trapezoidal approximations. I.e. sum of triangles and rectangles. <br>\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 55,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def area_under_roc(TPR, FPR):\n",
+    "    ans = 0\n",
+    "    for k in range(1, len(TPR)):\n",
+    "        triange = abs(FPR[k] - FPR[k-1]) * (TPR[k] - TPR[k-1]) / 2\n",
+    "        rectangle = abs((FPR[k] - FPR[k-1]) * min(TPR[k], TPR[k-1]))\n",
+    "        ans += triange + rectangle\n",
+    "        \n",
+    "    return ans"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Results"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Sensitivity (true positive rate) and Specificity (true negative rate)\n",
+    "Measures the proportion of actual positives/negatives that are correctly identified as such."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 56,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      #output woukd be an image 
+   "text/plain": [
+       "<Figure size 560x400 with 1 Axes>"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Area under the curve: 0.5631962159863946\n"
+     ]
+    }
+   ],
+   "source": [
+    "plt.figure(num=None, figsize=(7, 5), dpi=80, facecolor='w', edgecolor='k')\n",
+    "plt.plot(TNR, TPR, c='orange', label=\"Logistic Regression\")\n",
+    "plt.plot([0,1],[1,0], linestyle='--', label=\"Null Hypothesis\")\n",
+    "plt.xlabel('Specificity (TNR)')\n",
+    "plt.ylabel('Sensitivity (TPR)')\n",
+    "plt.title('Sensitivity (TPR) and Specificity (TNR)')\n",
+    "plt.legend(loc='lower left')\n",
+    "plt.show()\n",
+    "\n",
+    "print(f'Area under the curve: {area_under_roc(TNR, TPR)}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## ROC curve: False alarm (FPR) and Sensitivity (TPR) "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 57,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "data": {
+      #output would be an image
+      "text/plain": [
+       "<Figure size 560x400 with 1 Axes>"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Area under the curve: 0.5631962159863946\n"
+     ]
+    }
+   ],
+   "source": [
+    "plt.figure(num=None, figsize=(7, 5), dpi=80, facecolor='w', edgecolor='k')\n",
+    "plt.plot(FPR, TPR, c='orange', label=\"Logistic Regression\")\n",
+    "plt.plot([0,1],[0,1], linestyle='--', label=\"Null Hypothesis\")\n",
+    "plt.xlabel('False alarm (FPR)')\n",
+    "plt.ylabel('Sensitivity (TPR)')\n",
+    "plt.title('False alarm (FPR) and Sensitivity (TPR)')\n",
+    "plt.legend(loc='upper left')\n",
+    "plt.show()\n",
+    "\n",
+    "print(f'Area under the curve: {area_under_roc(TNR, TPR)}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Summary"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Baseline accuracy was around 51.6% for test data. <br>\n",
+    "After tuning our Logistic Regression parameters we got results similar to sklearn implementation.\n",
+    "Our model scores 55.88% on test, which is considerably better having in mind that predicting stock market is quite hard task."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.7.4"
+  },
+  "latex_envs": {
+   "LaTeX_envs_menu_present": true,
+   "autoclose": false,
+   "autocomplete": true,
+   "bibliofile": "biblio.bib",
+   "cite_by": "apalike",
+   "current_citInitial": 1,
+   "eqLabelWithNumbers": true,
+   "eqNumInitial": 1,
+   "hotkeys": {
+    "equation": "Ctrl-E",
+    "itemize": "Ctrl-I"
+   },
+   "labels_anchors": false,
+   "latex_user_defs": false,
+   "report_style_numbering": false,
+   "user_envs_cfg": false
+  },
+  "toc": {
+   "base_numbering": 1,
+   "nav_menu": {},
+   "number_sections": true,
+   "sideBar": true,
+   "skip_h1_title": false,
+   "title_cell": "Table of Contents",
+   "title_sidebar": "Contents",
+   "toc_cell": false,
+   "toc_position": {
+    "height": "calc(100% - 180px)",
+    "left": "10px",
+    "top": "150px",
+    "width": "279.273px"
+   },
+   "toc_section_display": true,
+   "toc_window_display": true
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
